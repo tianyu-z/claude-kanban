@@ -630,9 +630,12 @@ def collect_remote(server_conf, provider="claude"):
     # ControlMaster, which means hardware-backed keys (Secretive, Yubikey) would
     # prompt for confirmation on every poll. With system ssh + ControlPersist,
     # the user confirms once and the multiplex socket handles all later polls.
-    target = host
-    if server_conf.get("user"):
-        target = f"{server_conf['user']}@{host}"
+    if host.startswith("-") or any(c in host for c in " \t\n\r\x00"):
+        return [{"server": label, "error": f"invalid host: {host!r}"}]
+    user = server_conf.get("user")
+    if user and (user.startswith("-") or any(c in user for c in " \t\n\r\x00@")):
+        return [{"server": label, "error": f"invalid user: {user!r}"}]
+    target = f"{user}@{host}" if user else host
 
     cmd = [
         "ssh",
@@ -641,11 +644,12 @@ def collect_remote(server_conf, provider="claude"):
         "-o", "StrictHostKeyChecking=accept-new",
     ]
     if server_conf.get("port"):
-        cmd.extend(["-p", str(server_conf["port"])])
+        cmd.extend(["-p", str(int(server_conf["port"]))])
     if server_conf.get("hostname"):
         cmd.extend(["-o", f"HostName={server_conf['hostname']}"])
     if server_conf.get("key"):
         cmd.extend(["-i", os.path.expanduser(server_conf["key"])])
+    cmd.append("--")  # stop option parsing; defend against `-`-prefixed targets
     cmd.append(target)
     cmd.append(f"python3 -c {_shell_quote(script)}")
 
@@ -1087,8 +1091,7 @@ def _collect_all():
             try:
                 result = future.result()
                 for s in result:
-                    if "error" not in s and "provider" not in s:
-                        s["provider"] = p
+                    s.setdefault("provider", p)
                 all_sessions.extend(result)
             except Exception as e:
                 all_sessions.append({"server": label, "error": str(e), "provider": p})
@@ -1250,23 +1253,35 @@ def api_config_providers():
 
 @app.route("/api/servers/<int:idx>/test", methods=["POST"])
 def api_servers_test(idx):
-    """Test SSH connection to a server."""
+    """Test SSH connection to a server for each currently-selected provider."""
     config = load_config()
     providers = config.get("providers") or ["claude"]
-    provider = providers[0]
     servers = config.get("servers", [])
     if idx < 0 or idx >= len(servers):
         return jsonify({"error": "Server not found"}), 404
 
     srv = servers[idx]
-    try:
-        result = collect_remote(srv, provider)
-        has_error = any("error" in r for r in result)
-        if has_error:
-            return jsonify({"ok": False, "error": result[0].get("error", "Unknown error")})
-        return jsonify({"ok": True, "sessions": len(result)})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)})
+    per_provider = []
+    for p in providers:
+        try:
+            result = collect_remote(srv, p)
+            err = next((r.get("error") for r in result if "error" in r), None)
+            if err:
+                per_provider.append({"provider": p, "ok": False, "error": err})
+            else:
+                per_provider.append({"provider": p, "ok": True, "sessions": len(result)})
+        except Exception as e:
+            per_provider.append({"provider": p, "ok": False, "error": str(e)})
+
+    overall_ok = all(r["ok"] for r in per_provider)
+    total_sessions = sum(r.get("sessions", 0) for r in per_provider if r["ok"])
+    return jsonify({
+        "ok": overall_ok,
+        "sessions": total_sessions,
+        "results": per_provider,
+        # Legacy single-error field for older UIs
+        "error": next((r["error"] for r in per_provider if not r["ok"]), None),
+    })
 
 
 def _invalidate_cache():

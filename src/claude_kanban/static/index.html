@@ -687,7 +687,10 @@ function renderCard(session, isError, showDismiss) {
     return `
       <div class="card error-card">
         <div class="card-top">
-          <span class="card-server">${escapeHtml(session.server || 'unknown')}</span>
+          <span>
+            <span class="card-server">${escapeHtml(session.server || 'unknown')}</span>
+            ${session.provider ? `<span class="card-model">${escapeHtml(session.provider)}</span>` : ''}
+          </span>
         </div>
         <div class="card-task">Connection failed: ${escapeHtml(session.error)}</div>
       </div>`;
@@ -696,6 +699,7 @@ function renderCard(session, isError, showDismiss) {
   const dismissBtn = showDismiss
     ? `<button class="btn-dismiss" onclick="dismissSession('${session.sessionId}')" title="Dismiss">&times;</button>`
     : '';
+  const pidLabel = session.pid ? `PID ${session.pid}` : (session.provider || '');
   return `
     <div class="card">
       <div class="card-top">
@@ -703,7 +707,7 @@ function renderCard(session, isError, showDismiss) {
           <span class="card-server">${escapeHtml(session.server || 'unknown')}</span>
           ${session.model ? `<span class="card-model">${escapeHtml(session.model)}</span>` : ''}
         </span>
-        <span class="card-pid">${alive ? '<span class="pulse"></span> ' : ''}PID ${session.pid || '?'}${dismissBtn}</span>
+        <span class="card-pid">${alive ? '<span class="pulse"></span> ' : ''}${escapeHtml(pidLabel)}${dismissBtn}</span>
       </div>
       <div class="card-project">${escapeHtml(session.project || 'unknown')}</div>
       <div class="card-cwd">${escapeHtml(session.cwd || '')}</div>
@@ -868,18 +872,24 @@ function renderProviderCheckboxes(available, selected) {
       <span>${escapeHtml(p.label)}</span>
     </label>
   `).join('');
+  updateProviderCheckboxLockState();
+}
+
+function updateProviderCheckboxLockState() {
+  const boxes = Array.from(document.querySelectorAll('.provider-cb'));
+  const checked = boxes.filter(b => b.checked);
+  // When only one is left checked, lock it so users can't end up with zero providers
+  boxes.forEach(b => {
+    const lockLast = checked.length === 1 && b.checked;
+    b.disabled = lockLast;
+    b.title = lockLast ? 'At least one provider must be selected' : '';
+  });
 }
 
 async function onProviderToggle() {
   const checked = Array.from(document.querySelectorAll('.provider-cb:checked')).map(cb => cb.value);
-  if (checked.length === 0) {
-    // Force at least one — re-check the first available checkbox
-    const first = document.querySelector('.provider-cb');
-    if (first) {
-      first.checked = true;
-      checked.push(first.value);
-    }
-  }
+  if (checked.length === 0) return;  // shouldn't happen — the last box is locked
+  updateProviderCheckboxLockState();
   await fetch('/api/config/providers', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
@@ -990,13 +1000,15 @@ async function testServer(idx) {
   try {
     const res = await fetch(`/api/servers/${idx}/test`, { method: 'POST' });
     const result = await res.json();
-    if (result.ok) {
-      el.className = 'test-result test-ok';
-      el.textContent = `Connected - ${result.sessions} session(s) found`;
-    } else {
-      el.className = 'test-result test-fail';
-      el.textContent = `Failed: ${result.error}`;
-    }
+    const lines = (result.results || []).map(r =>
+      r.ok
+        ? `✓ ${r.provider}: ${r.sessions} session(s)`
+        : `✗ ${r.provider}: ${r.error}`
+    );
+    el.className = 'test-result ' + (result.ok ? 'test-ok' : 'test-fail');
+    el.innerHTML = lines.length
+      ? lines.map(l => `<div>${escapeHtml(l)}</div>`).join('')
+      : (result.ok ? `Connected - ${result.sessions} session(s)` : `Failed: ${escapeHtml(result.error || 'unknown')}`);
   } catch (e) {
     el.className = 'test-result test-fail';
     el.textContent = `Error: ${e.message}`;
