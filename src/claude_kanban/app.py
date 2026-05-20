@@ -39,6 +39,11 @@ PROVIDERS = {
         "session_dir": ".codex/sessions",
         "project_dir": ".codex/sessions",
     },
+    "opencode": {
+        "label": "Opencode",
+        "session_dir": ".local/share/opencode",
+        "project_dir": ".local/share/opencode",
+    },
 }
 _cache = {"data": None, "ts": 0, "lock": threading.Lock()}
 
@@ -69,20 +74,43 @@ _known_sessions = {"lock": threading.Lock(), "running": {}, "completed": {}}
 
 
 def _default_config():
-    return {"provider": "claude", "include_local": True, "servers": []}
+    return {"providers": ["claude"], "include_local": True, "servers": []}
 
 
-def _normalize_provider(provider):
-    if provider == "both":
-        return "both"
-    if provider in PROVIDERS:
-        return provider
-    return "claude"
+_PROVIDER_ALIASES = {
+    "all": list(PROVIDERS.keys()),
+    "both": ["claude", "codex"],  # legacy alias from earlier fork version
+}
+
+
+def _normalize_providers(value):
+    """Coerce config input into a clean list of valid provider keys.
+
+    Accepts: list of strings, single string, "all"/"both" aliases.
+    Preserves order, dedupes, drops unknown values.
+    """
+    if isinstance(value, str):
+        if value in _PROVIDER_ALIASES:
+            return list(_PROVIDER_ALIASES[value])
+        return [value] if value in PROVIDERS else []
+    if isinstance(value, list):
+        out = []
+        seen = set()
+        for v in value:
+            for p in _normalize_providers(v):
+                if p not in seen:
+                    seen.add(p)
+                    out.append(p)
+        return out
+    return []
 
 
 def _normalize_config(config):
     cfg = dict(config or {})
-    cfg["provider"] = _normalize_provider(cfg.get("provider"))
+    # Migrate legacy `provider` single-string key to `providers` list
+    providers = _normalize_providers(cfg.get("providers", cfg.get("provider")))
+    cfg["providers"] = providers or ["claude"]
+    cfg.pop("provider", None)
     cfg["include_local"] = bool(cfg.get("include_local", True))
     servers = cfg.get("servers")
     cfg["servers"] = servers if isinstance(servers, list) else []
@@ -332,17 +360,114 @@ def collect_local_codex():
 
 
 def collect_local(provider):
-    if provider == "both":
-        claude_sessions = collect_local_claude()
-        for s in claude_sessions:
-            s["provider"] = "claude"
-        codex_sessions = collect_local_codex()
-        for s in codex_sessions:
-            s["provider"] = "codex"
-        return claude_sessions + codex_sessions
     if provider == "codex":
         return collect_local_codex()
+    if provider == "opencode":
+        return collect_local_opencode()
     return collect_local_claude()
+
+
+def collect_local_opencode():
+    """Collect Opencode v2 sessions from the local SQLite database."""
+    import sqlite3
+    home = Path.home()
+    db_path = home / ".local" / "share" / "opencode" / "opencode.db"
+    server_name = platform.node() or "localhost"
+    if not db_path.exists():
+        return []
+    try:
+        sessions = _opencode_query(str(db_path))
+    except sqlite3.Error as e:
+        print(f"[WARN] opencode SQLite error: {e}")
+        return []
+    for s in sessions:
+        s["server"] = server_name
+    return sessions
+
+
+def _opencode_query(db_path):
+    """Run the opencode session query against a SQLite database path."""
+    import sqlite3
+    MAX = 100
+    ACTIVE_WINDOW_MS = 5 * 60 * 1000
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10)
+    cur = conn.cursor()
+    rows = cur.execute(
+        "SELECT id, title, model, agent, directory, time_created, time_updated "
+        "FROM session WHERE parent_id IS NULL AND time_archived IS NULL "
+        "ORDER BY time_updated DESC LIMIT ?",
+        (MAX,),
+    ).fetchall()
+    now_ms = int(time.time() * 1000)
+    sessions = []
+    for sid, title, model_json, agent, cwd, t_created, t_updated in rows:
+        try:
+            model = json.loads(model_json) if model_json else {}
+        except (json.JSONDecodeError, TypeError):
+            model = {}
+        model_id = model.get("id") or ""
+
+        msg_count = cur.execute(
+            "SELECT count(*) FROM message WHERE session_id=?", (sid,)
+        ).fetchone()[0]
+
+        cur.execute(
+            "SELECT json_extract(m.data,'$.role'), p.data "
+            "FROM message m JOIN part p ON p.message_id=m.id "
+            "WHERE m.session_id=? AND json_extract(p.data,'$.type')='text' "
+            "ORDER BY m.time_created",
+            (sid,),
+        )
+        all_msgs = []
+        for role, pdata in cur.fetchall():
+            try:
+                p = json.loads(pdata)
+                text = (p.get("text") or "").strip()[:500]
+                if text:
+                    all_msgs.append({"role": role or "user", "text": text})
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+        excerpt = list(all_msgs[:3])
+        seen = {m["text"] for m in excerpt}
+        for m in all_msgs[-6:]:
+            if m["text"] not in seen:
+                excerpt.append(m)
+                seen.add(m["text"])
+
+        task_summary = title or ""
+        if not task_summary:
+            for m in all_msgs:
+                if m["role"] == "user":
+                    task_summary = m["text"][:300]
+                    break
+
+        if task_summary and "concise status reporter" in task_summary:
+            continue
+
+        alive = bool(t_updated and (now_ms - t_updated) <= ACTIVE_WINDOW_MS)
+        started_iso = datetime.fromtimestamp(t_created / 1000, tz=timezone.utc).isoformat() if t_created else ""
+        last_iso = datetime.fromtimestamp(t_updated / 1000, tz=timezone.utc).isoformat() if t_updated else ""
+
+        sessions.append({
+            "sessionId": sid,
+            "pid": None,
+            "cwd": cwd or "",
+            "project": os.path.basename(cwd) if cwd else "",
+            "startedAt": started_iso,
+            "lastActivity": last_iso,
+            "kind": "opencode",
+            "entrypoint": "opencode",
+            "alive": alive,
+            "taskSummary": task_summary[:300],
+            "messageCount": msg_count,
+            "tokenUsage": {"totalInputTokens": 0, "totalOutputTokens": 0, "cacheCreationTokens": 0, "cacheReadTokens": 0},
+            "conversationExcerpt": excerpt,
+            "model": model_id,
+            "agent": agent or "",
+        })
+    conn.close()
+    return sessions
 
 
 def _find_jsonl(session_id, projects_dir):
@@ -498,17 +623,6 @@ def collect_remote(server_conf, provider="claude"):
     host = server_conf["host"]
     label = server_conf.get("label", host)
 
-    if provider == "both":
-        claude_sessions = collect_remote(server_conf, "claude")
-        for s in claude_sessions:
-            if "error" not in s:
-                s["provider"] = "claude"
-        codex_sessions = collect_remote(server_conf, "codex")
-        for s in codex_sessions:
-            if "error" not in s:
-                s["provider"] = "codex"
-        return claude_sessions + codex_sessions
-
     script = _remote_script(provider)
 
     # Shell out to the system `ssh` binary so we honor the user's full SSH config
@@ -565,6 +679,106 @@ def _shell_quote(s):
 
 def _remote_script(provider):
     """Python script to run on remote servers to collect session data."""
+    if provider == "opencode":
+        return r'''
+import json, os, sys, time, sqlite3
+from pathlib import Path
+from datetime import datetime, timezone
+
+ACTIVE_WINDOW_MS = 5 * 60 * 1000
+MAX = 100
+
+home = Path.home()
+db_path = home / ".local" / "share" / "opencode" / "opencode.db"
+if not db_path.exists():
+    print("[]")
+    sys.exit(0)
+
+try:
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10)
+except sqlite3.Error:
+    print("[]")
+    sys.exit(0)
+
+cur = conn.cursor()
+rows = cur.execute(
+    "SELECT id, title, model, agent, directory, time_created, time_updated "
+    "FROM session WHERE parent_id IS NULL AND time_archived IS NULL "
+    "ORDER BY time_updated DESC LIMIT ?",
+    (MAX,),
+).fetchall()
+
+now_ms = int(time.time() * 1000)
+sessions = []
+for sid, title, model_json, agent, cwd, t_created, t_updated in rows:
+    try:
+        model = json.loads(model_json) if model_json else {}
+    except (json.JSONDecodeError, TypeError):
+        model = {}
+    model_id = model.get("id") or ""
+
+    msg_count = cur.execute(
+        "SELECT count(*) FROM message WHERE session_id=?", (sid,)
+    ).fetchone()[0]
+
+    cur.execute(
+        "SELECT json_extract(m.data,'$.role'), p.data "
+        "FROM message m JOIN part p ON p.message_id=m.id "
+        "WHERE m.session_id=? AND json_extract(p.data,'$.type')='text' "
+        "ORDER BY m.time_created",
+        (sid,),
+    )
+    all_msgs = []
+    for role, pdata in cur.fetchall():
+        try:
+            p = json.loads(pdata)
+            text = (p.get("text") or "").strip()[:500]
+            if text:
+                all_msgs.append({"role": role or "user", "text": text})
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+    excerpt = list(all_msgs[:3])
+    seen = {m["text"] for m in excerpt}
+    for m in all_msgs[-6:]:
+        if m["text"] not in seen:
+            excerpt.append(m)
+            seen.add(m["text"])
+
+    task = title or ""
+    if not task:
+        for m in all_msgs:
+            if m["role"] == "user":
+                task = m["text"][:300]
+                break
+    if task and "concise status reporter" in task:
+        continue
+
+    alive = bool(t_updated and (now_ms - t_updated) <= ACTIVE_WINDOW_MS)
+    started_iso = datetime.fromtimestamp(t_created/1000, tz=timezone.utc).isoformat() if t_created else ""
+    last_iso = datetime.fromtimestamp(t_updated/1000, tz=timezone.utc).isoformat() if t_updated else ""
+
+    sessions.append({
+        "sessionId": sid,
+        "pid": None,
+        "cwd": cwd or "",
+        "project": os.path.basename(cwd) if cwd else "",
+        "startedAt": started_iso,
+        "lastActivity": last_iso,
+        "kind": "opencode",
+        "entrypoint": "opencode",
+        "alive": alive,
+        "taskSummary": task[:300],
+        "messageCount": msg_count,
+        "tokenUsage": {"totalInputTokens": 0, "totalOutputTokens": 0, "cacheCreationTokens": 0, "cacheReadTokens": 0},
+        "conversationExcerpt": excerpt,
+        "model": model_id,
+        "agent": agent or "",
+    })
+
+print(json.dumps(sessions))
+'''
+
     if provider == "codex":
         return r'''
 import json, os, sys, time
@@ -852,31 +1066,33 @@ print(json.dumps(results))
 # ---------------------------------------------------------------------------
 
 def _collect_all():
-    """Collect sessions from all configured sources in parallel."""
+    """Collect sessions from all configured (source, provider) pairs in parallel."""
     config = load_config()
-    provider = config.get("provider", "claude")
+    providers = config.get("providers") or ["claude"]
     all_sessions = []
 
     with ThreadPoolExecutor(max_workers=10) as pool:
         futures = {}
 
         if config.get("include_local", True):
-            futures[pool.submit(collect_local, provider)] = "local"
+            for p in providers:
+                futures[pool.submit(collect_local, p)] = ("local", p)
 
         for srv in config.get("servers", []):
-            futures[pool.submit(collect_remote, srv, provider)] = srv.get("label", srv["host"])
+            for p in providers:
+                futures[pool.submit(collect_remote, srv, p)] = (srv.get("label", srv["host"]), p)
 
         for future in as_completed(futures):
+            label, p = futures[future]
             try:
                 result = future.result()
+                for s in result:
+                    if "error" not in s and "provider" not in s:
+                        s["provider"] = p
                 all_sessions.extend(result)
             except Exception as e:
-                label = futures[future]
-                all_sessions.append({"server": label, "error": str(e)})
+                all_sessions.append({"server": label, "error": str(e), "provider": p})
 
-    for s in all_sessions:
-        if "error" not in s and "provider" not in s:
-            s["provider"] = provider
     return all_sessions
 
 
@@ -942,7 +1158,8 @@ def api_servers_list():
     return jsonify({
         "servers": servers,
         "include_local": config.get("include_local", True),
-        "provider": config.get("provider", "claude"),
+        "providers": config.get("providers") or ["claude"],
+        "available_providers": [{"key": k, "label": v["label"]} for k, v in PROVIDERS.items()],
     })
 
 
@@ -1017,23 +1234,26 @@ def api_config_local():
     return jsonify({"ok": True, "include_local": config["include_local"]})
 
 
-@app.route("/api/config/provider", methods=["PUT"])
-def api_config_provider():
-    """Set session provider (claude or codex)."""
+@app.route("/api/config/providers", methods=["PUT"])
+def api_config_providers():
+    """Set the active list of session providers."""
     body = request.get_json() or {}
-    provider = _normalize_provider(body.get("provider"))
+    providers = _normalize_providers(body.get("providers", body.get("provider")))
+    if not providers:
+        providers = ["claude"]
     config = load_config()
-    config["provider"] = provider
+    config["providers"] = providers
     save_config(config)
     _invalidate_cache()
-    return jsonify({"ok": True, "provider": provider})
+    return jsonify({"ok": True, "providers": providers})
 
 
 @app.route("/api/servers/<int:idx>/test", methods=["POST"])
 def api_servers_test(idx):
     """Test SSH connection to a server."""
     config = load_config()
-    provider = config.get("provider", "claude")
+    providers = config.get("providers") or ["claude"]
+    provider = providers[0]
     servers = config.get("servers", [])
     if idx < 0 or idx >= len(servers):
         return jsonify({"error": "Server not found"}), 404

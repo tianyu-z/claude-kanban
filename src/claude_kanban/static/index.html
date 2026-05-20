@@ -158,6 +158,16 @@
     border-radius: 4px;
   }
 
+  .card-model {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--purple);
+    background: rgba(188, 140, 255, 0.1);
+    padding: 2px 8px;
+    border-radius: 4px;
+    margin-left: 6px;
+  }
+
   .card-pid {
     font-size: 11px;
     color: var(--text-dim);
@@ -575,16 +585,10 @@
         </div>
         <div class="setting-row">
           <div>
-            <label>Session provider</label>
-            <div class="desc">Choose which local/remote session format to scan and summarize</div>
+            <label>Session providers</label>
+            <div class="desc">Check the session formats you want to scan and summarize (at least one)</div>
           </div>
-          <div>
-            <select id="provider-select" onchange="setProvider(this.value)" style="background:var(--bg); color:var(--text); border:1px solid var(--border); padding:6px 10px; border-radius:6px;">
-              <option value="claude">Claude Code</option>
-              <option value="codex">Codex</option>
-              <option value="both">Both</option>
-            </select>
-          </div>
+          <div id="provider-checkboxes" style="display:flex; gap:14px; flex-wrap:wrap; align-items:center;"></div>
         </div>
       </div>
 
@@ -695,7 +699,10 @@ function renderCard(session, isError, showDismiss) {
   return `
     <div class="card">
       <div class="card-top">
-        <span class="card-server">${escapeHtml(session.server || 'unknown')}</span>
+        <span>
+          <span class="card-server">${escapeHtml(session.server || 'unknown')}</span>
+          ${session.model ? `<span class="card-model">${escapeHtml(session.model)}</span>` : ''}
+        </span>
         <span class="card-pid">${alive ? '<span class="pulse"></span> ' : ''}PID ${session.pid || '?'}${dismissBtn}</span>
       </div>
       <div class="card-project">${escapeHtml(session.project || 'unknown')}</div>
@@ -815,8 +822,7 @@ async function loadServerList() {
     const data = await res.json();
 
     document.getElementById('toggle-local').checked = data.include_local;
-    const providerSelect = document.getElementById('provider-select');
-    if (providerSelect) providerSelect.value = data.provider || 'claude';
+    renderProviderCheckboxes(data.available_providers || [], data.providers || ['claude']);
 
     const container = document.getElementById('server-list');
     if (data.servers.length === 0) {
@@ -852,11 +858,32 @@ async function toggleLocal(checked) {
   });
 }
 
-async function setProvider(provider) {
-  await fetch('/api/config/provider', {
+function renderProviderCheckboxes(available, selected) {
+  const container = document.getElementById('provider-checkboxes');
+  if (!container) return;
+  const selectedSet = new Set(selected);
+  container.innerHTML = available.map(p => `
+    <label style="display:inline-flex; align-items:center; gap:6px; cursor:pointer; user-select:none;">
+      <input type="checkbox" class="provider-cb" value="${escapeHtml(p.key)}" ${selectedSet.has(p.key) ? 'checked' : ''} onchange="onProviderToggle()">
+      <span>${escapeHtml(p.label)}</span>
+    </label>
+  `).join('');
+}
+
+async function onProviderToggle() {
+  const checked = Array.from(document.querySelectorAll('.provider-cb:checked')).map(cb => cb.value);
+  if (checked.length === 0) {
+    // Force at least one — re-check the first available checkbox
+    const first = document.querySelector('.provider-cb');
+    if (first) {
+      first.checked = true;
+      checked.push(first.value);
+    }
+  }
+  await fetch('/api/config/providers', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ provider }),
+    body: JSON.stringify({ providers: checked }),
   });
   render(true);
 }

@@ -8,11 +8,16 @@ If you run coding agents on multiple machines simultaneously, it's easy to lose 
 
 ## Fork changes (vs. [ShenJiahuan/claude-kanban](https://github.com/ShenJiahuan/claude-kanban))
 
-This fork diverges from upstream in two ways:
+This fork diverges from upstream in three ways:
 
-### 1. `both` provider — show Claude Code **and** Codex side-by-side
+### 1. Opencode support + multi-provider checkboxes
 
-Upstream forces you to pick either `claude` or `codex`. This fork adds a third option, `both`, which fans out per source (local + each remote) and returns the union, tagging every session with its real provider. Pick **Both** in *Settings → Session provider*.
+Upstream supports only `claude` and `codex` as a single dropdown choice. This fork:
+- Adds **Opencode** as a third provider — reads sessions directly from the Opencode v2 SQLite database at `~/.local/share/opencode/opencode.db`
+- Replaces the provider dropdown with **checkboxes** so you can scan any subset (Claude only / Claude + Opencode / all three / etc.)
+- Each session card shows the **model name** when available (e.g. `DeepSeek-V4-Pro`, `Kimi-K2.6`), useful for Opencode where you switch between providers per session
+
+Config schema changed from `provider: <string>` to `providers: [<list>]` — old configs (including `provider: both` from the previous fork version) migrate automatically.
 
 ### 2. Remote collection shells out to system `ssh` (instead of paramiko)
 
@@ -44,7 +49,7 @@ uv run claude-kanban
 
 - **Multi-server monitoring** — SSH into remote servers to collect session data in parallel
 - **Live kanban board** — Sessions organized into Running / Completed / Errors columns
-- **Multi-provider support** — `claude`, `codex`, or `both` (this fork) from Settings
+- **Multi-provider support** — any subset of `claude`, `codex`, `opencode` via checkboxes (this fork)
 - **AI-powered summaries** — Sessions are summarized by local CLI (`claude` or `codex`) with task description, progress status, and estimated completion percentage
 - **Auto-refresh** — Dashboard updates automatically; fast-polls on first load to pick up AI summaries quickly
 - **Session lifecycle tracking** — Sessions move from Running to Completed when the Claude Code process exits; resumed sessions move back to Running
@@ -99,7 +104,9 @@ All configuration is done through the web UI (**Settings** button). Under the ho
 
 ```yaml
 include_local: true
-provider: claude  # claude | codex | both
+providers:        # any non-empty subset of: claude, codex, opencode
+  - claude
+  - opencode
 servers:
   - host: gpu-server-1.example.com
     user: ubuntu
@@ -126,6 +133,7 @@ servers:
 - Python 3 installed
 - For `claude` provider: Claude Code installed (sessions stored in `~/.claude/`)
 - For `codex` provider: Codex installed (sessions stored in `~/.codex/`)
+- For `opencode` provider: Opencode v2 installed (SQLite DB at `~/.local/share/opencode/opencode.db`)
 - SSH key-based authentication configured
 
 ### Environment variables
@@ -147,7 +155,7 @@ servers:
 | `DELETE /api/servers/<id>`       | DELETE | Remove a server                      |
 | `POST /api/servers/<id>/test`    | POST   | Test SSH connection                  |
 | `PUT /api/config/local`          | PUT    | Toggle local machine scanning        |
-| `PUT /api/config/provider`       | PUT    | Set provider (`claude` / `codex` / `both`) |
+| `PUT /api/config/providers`      | PUT    | Set active providers (array of `claude` / `codex` / `opencode`) |
 
 ## License
 
