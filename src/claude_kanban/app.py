@@ -73,6 +73,8 @@ def _default_config():
 
 
 def _normalize_provider(provider):
+    if provider == "both":
+        return "both"
     if provider in PROVIDERS:
         return provider
     return "claude"
@@ -330,6 +332,14 @@ def collect_local_codex():
 
 
 def collect_local(provider):
+    if provider == "both":
+        claude_sessions = collect_local_claude()
+        for s in claude_sessions:
+            s["provider"] = "claude"
+        codex_sessions = collect_local_codex()
+        for s in codex_sessions:
+            s["provider"] = "codex"
+        return claude_sessions + codex_sessions
     if provider == "codex":
         return collect_local_codex()
     return collect_local_claude()
@@ -488,51 +498,51 @@ def collect_remote(server_conf, provider="claude"):
     host = server_conf["host"]
     label = server_conf.get("label", host)
 
+    if provider == "both":
+        claude_sessions = collect_remote(server_conf, "claude")
+        for s in claude_sessions:
+            if "error" not in s:
+                s["provider"] = "claude"
+        codex_sessions = collect_remote(server_conf, "codex")
+        for s in codex_sessions:
+            if "error" not in s:
+                s["provider"] = "codex"
+        return claude_sessions + codex_sessions
+
     script = _remote_script(provider)
 
+    # Shell out to the system `ssh` binary so we honor the user's full SSH config
+    # (ControlMaster sockets, IdentityAgent, ProxyCommand, etc). paramiko can't do
+    # ControlMaster, which means hardware-backed keys (Secretive, Yubikey) would
+    # prompt for confirmation on every poll. With system ssh + ControlPersist,
+    # the user confirms once and the multiplex socket handles all later polls.
+    target = host
+    if server_conf.get("user"):
+        target = f"{server_conf['user']}@{host}"
+
+    cmd = [
+        "ssh",
+        "-o", "ConnectTimeout=10",
+        "-o", "ServerAliveInterval=15",
+        "-o", "StrictHostKeyChecking=accept-new",
+    ]
+    if server_conf.get("port"):
+        cmd.extend(["-p", str(server_conf["port"])])
+    if server_conf.get("hostname"):
+        cmd.extend(["-o", f"HostName={server_conf['hostname']}"])
+    if server_conf.get("key"):
+        cmd.extend(["-i", os.path.expanduser(server_conf["key"])])
+    cmd.append(target)
+    cmd.append(f"python3 -c {_shell_quote(script)}")
+
     try:
-        ssh_config = _load_ssh_config()
-        ssh_info = ssh_config.lookup(host)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+        if result.returncode != 0:
+            stderr = result.stderr.strip() or result.stdout.strip()
+            last_line = stderr.splitlines()[-1] if stderr else f"ssh exit {result.returncode}"
+            return [{"server": label, "error": last_line}]
 
-        hostname = server_conf.get("hostname", ssh_info.get("hostname", host))
-        port = server_conf.get("port", int(ssh_info.get("port", 22)))
-        user = server_conf.get("user", ssh_info.get("user", os.getenv("USER", "root")))
-
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-        connect_kwargs = {
-            "hostname": hostname,
-            "port": port,
-            "username": user,
-            "timeout": 10,
-            "banner_timeout": 10,
-        }
-
-        # Set up ProxyCommand if defined in SSH config
-        proxy_cmd = ssh_info.get("proxycommand")
-        if proxy_cmd:
-            connect_kwargs["sock"] = paramiko.ProxyCommand(proxy_cmd)
-
-        # Determine SSH key
-        key_path = server_conf.get("key")
-        if key_path:
-            key_path = os.path.expanduser(key_path)
-        elif "identityfile" in ssh_info:
-            key_path = os.path.expanduser(ssh_info["identityfile"][0])
-        else:
-            key_path = os.path.expanduser("~/.ssh/id_rsa")
-
-        if os.path.exists(key_path):
-            connect_kwargs["key_filename"] = key_path
-        else:
-            connect_kwargs["allow_agent"] = True
-
-        client.connect(**connect_kwargs)
-        _, stdout, stderr = client.exec_command(f"python3 -c {_shell_quote(script)}", timeout=30)
-        output = stdout.read().decode()
-        client.close()
-
+        output = result.stdout
         if not output.strip():
             return []
 
@@ -541,6 +551,8 @@ def collect_remote(server_conf, provider="claude"):
             s["server"] = label
         return sessions
 
+    except subprocess.TimeoutExpired:
+        return [{"server": label, "error": "SSH timeout (45s)"}]
     except Exception as e:
         print(f"[WARN] Failed to collect from {label} ({host}): {e}")
         return [{"server": label, "error": str(e)}]
@@ -863,7 +875,7 @@ def _collect_all():
                 all_sessions.append({"server": label, "error": str(e)})
 
     for s in all_sessions:
-        if "error" not in s:
+        if "error" not in s and "provider" not in s:
             s["provider"] = provider
     return all_sessions
 
