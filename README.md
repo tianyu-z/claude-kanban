@@ -6,11 +6,45 @@ If you run coding agents on multiple machines simultaneously, it's easy to lose 
 
 ![Claude Code Agent Kanban Screenshot](screenshot.png)
 
+## Fork changes (vs. [ShenJiahuan/claude-kanban](https://github.com/ShenJiahuan/claude-kanban))
+
+This fork diverges from upstream in two ways:
+
+### 1. `both` provider — show Claude Code **and** Codex side-by-side
+
+Upstream forces you to pick either `claude` or `codex`. This fork adds a third option, `both`, which fans out per source (local + each remote) and returns the union, tagging every session with its real provider. Pick **Both** in *Settings → Session provider*.
+
+### 2. Remote collection shells out to system `ssh` (instead of paramiko)
+
+Upstream uses [paramiko](https://www.paramiko.org/) for remote SSH. paramiko does **not** honor `ControlMaster`, `IdentityAgent`, or `ProxyCommand` from your `~/.ssh/config`. For users with hardware-backed agents (Secretive, YubiKey, Krypton), that means a fingerprint / touch prompt on *every* dashboard refresh — unusable.
+
+This fork replaces the paramiko call with a `subprocess.run(["ssh", host, ...])`, so:
+- Your full `~/.ssh/config` is honored (including `IdentityAgent`, `ProxyCommand`, `ControlMaster`)
+- With `ControlMaster auto` + `ControlPersist yes`, you confirm once per host then the multiplex socket handles all later polls — same behavior as VSCode Remote-SSH
+- The `host` field in the server config can be a plain SSH alias (e.g. `gpu-prod-0`) — ssh resolves hostname/user/port from your config
+
+Set up `ControlMaster` in `~/.ssh/config` if you haven't already:
+
+```
+Host *
+  ControlMaster auto
+  ControlPath ~/.ssh/sockets/%C
+  ControlPersist yes
+```
+
+### Install this fork
+
+```bash
+git clone https://github.com/tianyu-z/claude-kanban.git
+cd claude-kanban
+uv run claude-kanban
+```
+
 ## Features
 
 - **Multi-server monitoring** — SSH into remote servers to collect session data in parallel
 - **Live kanban board** — Sessions organized into Running / Completed / Errors columns
-- **Multi-provider support** — Switch between `claude` and `codex` providers from Settings
+- **Multi-provider support** — `claude`, `codex`, or `both` (this fork) from Settings
 - **AI-powered summaries** — Sessions are summarized by local CLI (`claude` or `codex`) with task description, progress status, and estimated completion percentage
 - **Auto-refresh** — Dashboard updates automatically; fast-polls on first load to pick up AI summaries quickly
 - **Session lifecycle tracking** — Sessions move from Running to Completed when the Claude Code process exits; resumed sessions move back to Running
@@ -65,7 +99,7 @@ All configuration is done through the web UI (**Settings** button). Under the ho
 
 ```yaml
 include_local: true
-provider: claude  # claude | codex
+provider: claude  # claude | codex | both
 servers:
   - host: gpu-server-1.example.com
     user: ubuntu
@@ -113,7 +147,7 @@ servers:
 | `DELETE /api/servers/<id>`       | DELETE | Remove a server                      |
 | `POST /api/servers/<id>/test`    | POST   | Test SSH connection                  |
 | `PUT /api/config/local`          | PUT    | Toggle local machine scanning        |
-| `PUT /api/config/provider`       | PUT    | Set provider (`claude` / `codex`)    |
+| `PUT /api/config/provider`       | PUT    | Set provider (`claude` / `codex` / `both`) |
 
 ## License
 
