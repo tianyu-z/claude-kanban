@@ -837,7 +837,10 @@ async function loadServerList() {
     container.innerHTML = data.servers.map((srv, i) => `
       <div class="server-item" id="srv-item-${i}">
         <div class="srv-info">
-          <div class="srv-label">${escapeHtml(srv.label || srv.host)}</div>
+          <div class="srv-label">
+            ${escapeHtml(srv.label || srv.host)}
+            ${srv.group ? `<span class="card-model" style="margin-left:8px;">Group: ${escapeHtml(srv.group)}</span>` : ''}
+          </div>
           <div class="srv-detail">${escapeHtml(srv.user || 'default')}@${escapeHtml(srv.host)}:${srv.port || 22}</div>
           ${srv.key ? `<div class="srv-detail">Key: ${escapeHtml(srv.key)}</div>` : ''}
           <div class="test-result" id="test-result-${i}"></div>
@@ -923,6 +926,10 @@ function renderServerForm(data) {
           <label>SSH Key Path</label>
           <input type="text" id="sf-key" placeholder="~/.ssh/id_rsa (leave empty for SSH agent)" value="${escapeHtml(data.key || '')}">
         </div>
+        <div class="form-group full">
+          <label>Group (optional)</label>
+          <input type="text" id="sf-group" placeholder="e.g. rno — servers in the same group are tried in order; first success wins" value="${escapeHtml(data.group || '')}">
+        </div>
       </div>
       <div class="form-actions">
         <button class="btn btn-sm" onclick="cancelForm()">Cancel</button>
@@ -961,12 +968,14 @@ function getFormData() {
   const user = document.getElementById('sf-user').value.trim();
   const port = document.getElementById('sf-port').value.trim();
   const key = document.getElementById('sf-key').value.trim();
+  const group = document.getElementById('sf-group').value.trim();
   if (!host) { alert('Host is required'); return null; }
   data.host = host;
   if (label) data.label = label;
   if (user) data.user = user;
   if (port) data.port = parseInt(port);
   if (key) data.key = key;
+  if (group) data.group = group;
   return data;
 }
 

@@ -676,6 +676,51 @@ def collect_remote(server_conf, provider="claude"):
         return [{"server": label, "error": str(e)}]
 
 
+def _ssh_has_control_master(server_conf):
+    """Return True if `ssh -O check <target>` reports an active multiplex socket."""
+    host = server_conf.get("host", "")
+    if not host or host.startswith("-") or any(c in host for c in " \t\n\r\x00"):
+        return False
+    user = server_conf.get("user")
+    if user and (user.startswith("-") or any(c in user for c in " \t\n\r\x00@")):
+        return False
+    target = f"{user}@{host}" if user else host
+
+    cmd = ["ssh", "-O", "check"]
+    if server_conf.get("port"):
+        cmd.extend(["-p", str(int(server_conf["port"]))])
+    if server_conf.get("hostname"):
+        cmd.extend(["-o", f"HostName={server_conf['hostname']}"])
+    cmd.append("--")
+    cmd.append(target)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=3)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _collect_group(servers, provider, group_label):
+    """Try the servers in a group; return the first non-error result.
+
+    Order: members with an active ControlMaster socket first (no touch
+    prompt, instant), then the rest in user-defined order. Falls back to
+    the next member only when SSH itself fails — an empty session list
+    from a working host counts as success.
+    """
+    ordered = sorted(servers, key=lambda s: 0 if _ssh_has_control_master(s) else 1)
+    last_error = None
+    for srv in ordered:
+        result = collect_remote(srv, provider)
+        errors = [r.get("error") for r in result if "error" in r]
+        if not errors:
+            for s in result:
+                s["server"] = group_label
+            return result
+        last_error = errors[0]
+    return [{"server": group_label, "error": last_error or "no members"}]
+
+
 def _shell_quote(s):
     """Shell-quote a string for remote execution."""
     return "'" + s.replace("'", "'\"'\"'") + "'"
@@ -1070,10 +1115,25 @@ print(json.dumps(results))
 # ---------------------------------------------------------------------------
 
 def _collect_all():
-    """Collect sessions from all configured (source, provider) pairs in parallel."""
+    """Collect sessions from all configured (source, provider) pairs in parallel.
+
+    Servers sharing a `group` value are treated as equivalent login nodes —
+    we try one member per (group, provider) and stop on the first success.
+    """
     config = load_config()
     providers = config.get("providers") or ["claude"]
     all_sessions = []
+
+    # Bucket: groups maps group_name -> [server_conf, ...] preserving config order;
+    # ungrouped is the list of standalone servers.
+    groups = {}
+    ungrouped = []
+    for srv in config.get("servers", []):
+        g = srv.get("group")
+        if isinstance(g, str) and g.strip():
+            groups.setdefault(g.strip(), []).append(srv)
+        else:
+            ungrouped.append(srv)
 
     with ThreadPoolExecutor(max_workers=10) as pool:
         futures = {}
@@ -1082,9 +1142,13 @@ def _collect_all():
             for p in providers:
                 futures[pool.submit(collect_local, p)] = ("local", p)
 
-        for srv in config.get("servers", []):
+        for srv in ungrouped:
             for p in providers:
                 futures[pool.submit(collect_remote, srv, p)] = (srv.get("label", srv["host"]), p)
+
+        for group_name, group_servers in groups.items():
+            for p in providers:
+                futures[pool.submit(_collect_group, group_servers, p, group_name)] = (group_name, p)
 
         for future in as_completed(futures):
             label, p = futures[future]
@@ -1174,7 +1238,7 @@ def api_servers_add():
         return jsonify({"error": "host is required"}), 400
 
     entry = {}
-    for key in ("host", "port", "user", "key", "label"):
+    for key in ("host", "port", "user", "key", "label", "group"):
         if server.get(key):
             val = server[key]
             entry[key] = int(val) if key == "port" else val
@@ -1199,7 +1263,7 @@ def api_servers_update(idx):
         return jsonify({"error": "Server not found"}), 404
 
     entry = {}
-    for key in ("host", "port", "user", "key", "label"):
+    for key in ("host", "port", "user", "key", "label", "group"):
         if server.get(key):
             val = server[key]
             entry[key] = int(val) if key == "port" else val
